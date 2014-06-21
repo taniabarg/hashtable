@@ -1,0 +1,399 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "HashTable.h"
+
+struct HashTableObjectTag
+{
+	int sentinel;
+	unsigned int size;
+	unsigned int keyCount;
+	struct node **root;
+	int dynamicBehaviour;
+    float expandUseFactor;
+    float contractUseFactor;
+};
+
+struct node
+{
+	char *key;
+	void *data;
+	struct node *left;
+	struct node *right;
+};
+
+//*** STATIC "HELPER" FUNCTIONS ***//
+
+static unsigned char HashFunction ( char *key, unsigned char range )
+{
+	int total = 0;
+	int pos;
+
+	for(int i = 0; i < strlen(key); i++)
+		total += (int) key[i];		//This hash function sums up values of each character,
+	pos = total % range;			//then divides by the range and returns the remainder.
+	if(pos < 0)
+		pos = -pos;
+
+	return (unsigned char) pos;
+}
+
+static struct node **FindHandle( struct node **rootHandle, char *key )
+{
+	if(*rootHandle == NULL)
+		return NULL;
+	else if(strcmp(key, (*rootHandle)->key) > 0) 
+		return FindHandle(&(*rootHandle)->right, key);
+	else if(strcmp(key, (*rootHandle)->key) < 0)
+		return FindHandle(&(*rootHandle)->left, key);
+	else return rootHandle;	
+	//Returns the address to the pointer of a node - useful for Delete and Find.
+}
+
+void FreeNode( HashTablePTR hashTable, struct node **rootHandle )
+{
+	free((*rootHandle)->key);
+	(*rootHandle)->key = NULL;
+	free((*rootHandle));
+	*rootHandle = NULL;
+	hashTable->keyCount--;
+	//This static function is used to free a node in the Delete function.
+}
+
+static int GetTreeKeys( struct node *root, char ***keysArrayHandle, unsigned int *count )
+{
+	if(root != NULL)
+	{
+		if(keysArrayHandle != NULL)
+		{
+			*((*keysArrayHandle) + *count) = calloc(strlen(root->key) + 1, sizeof(char));
+			//This allocates memory to each key in the array of keys.
+			if(*((*keysArrayHandle) + *count) == NULL)
+				return -2;
+			strcpy(*((*keysArrayHandle) + *count), root->key);
+		}
+		(*count)++;
+		GetTreeKeys(root->left, keysArrayHandle, count);
+		GetTreeKeys(root->right, keysArrayHandle, count);
+	}
+	
+	//Fills in the array with key entries for each bucket, or simply counts the size of each.
+	//Used in GetKeys, as well as in GetHashTableInfo to count the largest bucket size.
+	
+	return 0;
+}
+
+static void Resize(HashTablePTR hashTable, int type)
+{
+	//This function is used to resize a hashTable for both Insert AND Delete.
+	//type = 1 indicates the need for expansion. type = 2 indicates contraction.
+	
+	HashTableInfo info;
+	GetHashTableInfo(hashTable, &info);
+	while(info.useFactor > info.expandUseFactor || info.useFactor < info.contractUseFactor)
+	{
+		HashTablePTR newHashTable;
+		if(type == 1)
+			CreateHashTable(&newHashTable, (hashTable->size * 2));
+		else if(type == 2)
+		{
+			if((hashTable->size - 1) < 1)
+				return;
+			//If the size is 1, cannot contract the hashtable. Ignores dynamic behaviour and does not contract.
+			CreateHashTable(&newHashTable, (hashTable->size - 1));
+		}
+		//Doubles size for expansion. Subtracts one from size for contraction.
+		//(If this is still not enough to fix the useFactor, the loop will repeat.)
+		char *value;
+		char **keys;
+		unsigned int keyCount;
+		char *previous;
+		GetKeys(hashTable, &keys, &keyCount);
+		hashTable->dynamicBehaviour = 0;
+		newHashTable->dynamicBehaviour = 0; //(overrides expansion for the next few steps)
+		for(int i = 0; i < keyCount; i++)
+		{
+			//Finds each key & data, and inserts it into a new hashtable.
+			FindEntry(hashTable, keys[i], (void**) &value);
+			InsertEntry(newHashTable, keys[i], value, (void**) &previous);
+			free(keys[i]);
+		}
+		for(int pos = 0; pos < hashTable->size; pos++)
+		{
+			while(*(hashTable->root + pos) != NULL)
+			{
+				//Deletes all the keys from the old hashtable (but preserves keyCount).
+				DeleteEntry(hashTable, (*(hashTable->root + pos))->key, (void **) &value);
+				hashTable->keyCount++;
+			}
+		}
+		hashTable->dynamicBehaviour = 1; //(expansion set back to true)
+		if(type == 1)
+			hashTable->size *= 2;
+		else if(type == 2)
+			hashTable->size--;
+			
+		//Now, the old hashtable array of buckets is freed and its pointer is set to...
+		//...the new hashtable's array of buckets. Then, the new hashtable is freed.
+		free(hashTable->root); 
+		hashTable->root = newHashTable->root;
+		newHashTable->root = NULL;
+		free(newHashTable);
+		newHashTable = NULL;
+		free(keys);
+		GetHashTableInfo(hashTable, &info); //Gets info again in case resizing is needed again.
+	}
+}
+
+// *** ASSIGNED API FUNCTIONS ***//
+
+int CreateHashTable( HashTablePTR *hashTableHandle, unsigned int initialSize )
+{	
+	*hashTableHandle = calloc(1, sizeof(HashTableObject));
+	if(*hashTableHandle == NULL)
+		return -1;
+	
+	(*hashTableHandle)->size = initialSize;
+	if(initialSize < 1)
+		(*hashTableHandle)->size = 1; //Clamps to 1.
+	
+	(*hashTableHandle)->sentinel = (int)0xDEADBEEF;
+	(*hashTableHandle)->root = calloc(initialSize, sizeof(struct node *));
+	//Note: root is a double pointer. It is an ARRAY of ROOTS to binary tree nodes.
+	if((*hashTableHandle)->root == NULL)
+		return -1;
+	(*hashTableHandle)->keyCount = 0;
+	
+	for(struct node **p = (*hashTableHandle)->root; p < ((*hashTableHandle)->root) + initialSize; p++)
+		(*p) = NULL;	//Initializes each root to NULL. (Memory is allocated in insert function.)
+	
+	SetResizeBehaviour(*hashTableHandle, 1, (float)0.7, (float)0.2);
+	
+	return 0;
+}
+ 
+int DestroyHashTable( HashTablePTR *hashTableHandle )
+{
+	if(*hashTableHandle == NULL || *((int*)(*hashTableHandle)) != 0xDEADBEEF) //Sentinel test.
+		return -1;
+	
+	char *value;
+	
+	(*hashTableHandle)->dynamicBehaviour = 0;
+	for(int pos = 0; pos < (*hashTableHandle)->size; pos++)
+	{
+		while(*((*hashTableHandle)->root + pos) != NULL)
+		{
+			DeleteEntry(*hashTableHandle, (*((*hashTableHandle)->root + pos))->key, (void **) &value);
+			// Deletes all binary tree elements within each bucket, for every bucket.
+		}
+	}
+	
+	free((*hashTableHandle)->root);		//Frees the array of root pointers.
+	(*hashTableHandle)->root = NULL;
+	free(*hashTableHandle);				//Frees the entire hashtable.
+	*hashTableHandle = NULL;
+	
+	return 0;
+}
+ 
+int InsertEntry( HashTablePTR hashTable, char *key, void *data, void **previousDataHandle )
+{
+	if(hashTable == NULL || *((int*)(hashTable)) != 0xDEADBEEF)
+		return -1;
+	
+	unsigned char range = (unsigned char) hashTable->size;
+	int collision = 0;
+	int result;
+	
+	int pos = HashFunction(key, range);
+	struct node **p = (hashTable->root) + pos;	
+	//Note: *p now represents the specific bucket (hash position) where the key needs to be filled.
+		
+	if(*p != NULL)					//If the bucket is already filled...
+	{
+		while(*p != NULL)			//Situation A: Checks if key already exists, and if so, replaces data.
+		{
+			result = strcmp(key, (*p)->key);
+			if(result == 0)
+			{
+				*previousDataHandle = (*p)->data;
+				(*p)->data = data;
+				return 2;
+			}
+			else if(result > 0)		//If input key is greater than key we're looking at, move to right side...
+				p = &(*p)->right;
+			else if(result < 0)		//...if less, move to left side.
+				p = &(*p)->left;
+		}
+		collision = 1;		//Situation B: If key doesn't exist in that node, hash collision occurs.
+	}						//Boolean variable "collision" is set to 1 (true). Binary trees will be used for chaining.
+	
+	//Situation C is when the position was empty in the first place.
+	//So now, *p represents the correct position where the key and value need to be filled, regardless of whether it is situation B or C.
+	
+	(*p) = calloc(1, sizeof(struct node));
+	if((*p) == NULL)
+		return -2;
+	
+	(*p)->key = calloc(strlen(key) + 1, sizeof(char));	//Allocates memory to the specific spot in the array...
+	if((*p)->key == NULL)
+		return -2;			
+	strcpy(((*p)->key), key);							// ...and fills in according key and data.
+	(*p)->data = data;
+	(*p)->left = NULL;
+	(*p)->right = NULL;
+	
+	hashTable->keyCount++;
+	
+	if(hashTable->dynamicBehaviour == 1) 
+		Resize(hashTable, 1);			//(See Resize function - line 90)
+	
+	return collision;					//Returns 0 or 1 depending on whether there was a collision or not.
+}
+ 
+int DeleteEntry( HashTablePTR hashTable, char *key, void **dataHandle )
+{
+	if(hashTable == NULL || *((int*)(hashTable)) != 0xDEADBEEF)
+		return -1;
+
+	unsigned char range = (unsigned char) hashTable->size;
+	int pos = HashFunction(key, range);
+	struct node *del;	//TEMPORARY POINTER
+	
+	struct node **temp = FindHandle((hashTable->root) + pos, key);
+	if(temp == NULL)
+		return -1;
+	//Finds the address of the pointer to the to-be-deleted node; returns -1 if not found.
+	
+	if((*temp)->left != NULL) 
+	{	
+		//If there is a left element, starts there.
+		struct node **tempSwap = &(*temp)->left;
+		while((*tempSwap)->right != NULL)
+			tempSwap = &(*tempSwap)->right;
+		//Now tempSwap represents the largest element on the left side of the tree.
+		(*temp)->key = realloc((*temp)->key, (strlen((*tempSwap)->key) + 1) * sizeof(char));
+		strcpy((*temp)->key, (*tempSwap)->key);
+		*dataHandle = (*temp)->data;
+		(*temp)->data = (*tempSwap)->data;	//Replaces the to-be-deleted node's key & data with tempSwap's key & data,
+		del = *tempSwap;					//...and deletes end node. Similar to deletion of a linked list node.
+		*tempSwap = (*tempSwap)->left;
+		FreeNode(hashTable, &del);
+	}
+	else if((*temp)->right != NULL)
+	{
+		//Now, if the left one is NULL, we can traverse using the right node instead.
+		struct node **tempSwap = &(*temp)->right;
+		while((*tempSwap)->left != NULL)
+			tempSwap = &(*tempSwap)->left;
+		(*temp)->key = realloc((*temp)->key, (strlen((*tempSwap)->key) + 1) * sizeof(char));
+		strcpy((*temp)->key, (*tempSwap)->key);
+		*dataHandle = (*temp)->data;
+		(*temp)->data = (*tempSwap)->data;
+		del = *tempSwap;
+		*tempSwap = (*tempSwap)->right;
+		FreeNode(hashTable, &del);
+		//Same as above, but left and right are switched; i.e. takes the smallest element on the right side...
+		//...and swaps it with the to-be-deleted node, then deletes the end node.
+	}
+	else
+	{   //This means the node has no children. Simply free & set the pointer to NULL.
+		*dataHandle = (*temp)->data;
+		FreeNode(hashTable, temp);
+	}
+	
+	if(hashTable->dynamicBehaviour == 1)
+		Resize(hashTable, 2);				//(See Resize function - line 90)
+	
+	return 0;
+}
+ 
+int FindEntry( HashTablePTR hashTable, char *key, void **dataHandle )
+{
+	if(hashTable == NULL || *((int*)(hashTable)) != 0xDEADBEEF)
+		return -1;
+
+	unsigned char range =  (unsigned char) hashTable->size;
+	int pos = HashFunction(key, range);
+	struct node **result = FindHandle((hashTable->root) + pos, key);
+	//Uses FindHandle and dereferences the handle. See line 45 for FindHandle.)
+	
+	if(result == NULL)
+		return -2; //(if not found)
+	else
+	{
+		*dataHandle = (*result)->data;
+		return 0;
+	}
+}
+ 
+int GetKeys( HashTablePTR hashTable, char ***keysArrayHandle, unsigned int *keyCount )
+{
+	if(hashTable == NULL || *((int*)(hashTable)) != 0xDEADBEEF)
+		return -1;
+
+	*keyCount = hashTable->keyCount;
+	*keysArrayHandle = calloc(hashTable->keyCount, sizeof(char *));
+	//The above line allocates memory to the ARRAY of STRINGS (i.e. array of character pointers).
+	if(*keysArrayHandle == NULL)
+		return -2;
+	
+	unsigned int count = 0;
+	
+	for(int pos = 0; pos < hashTable->size; pos++)
+	{
+		if(GetTreeKeys(*((hashTable->root) + pos), keysArrayHandle, &count) == -2)
+			return -2;
+	}
+	
+	return 0;
+}
+
+//** New API Functions for 3B**//
+
+int GetHashTableInfo( HashTablePTR hashTable, HashTableInfo *pHashTableInfo )
+{
+	if(hashTable == NULL || *((int*)(hashTable)) != 0xDEADBEEF)
+		return -1;
+
+	pHashTableInfo->bucketCount = hashTable->size;
+	pHashTableInfo->loadFactor = (float)(hashTable->keyCount) / (float)(hashTable->size);
+	
+	int usedBuckets = 0;
+	unsigned int largestBucketSize = 1;
+	unsigned int count = 0;
+	for(int pos = 0; pos < hashTable->size; pos++)
+	{
+		if(*((hashTable->root) + pos) != NULL)
+		{
+			usedBuckets++; //If bucket is not NULL, it is being used.
+			GetTreeKeys(*((hashTable->root) + pos), NULL, &count);
+			if(count > largestBucketSize)
+				largestBucketSize = count; //Counts elements in each bucket & finds the largest one.
+			count = 0;
+		}		
+	}
+	
+	pHashTableInfo->useFactor = (float)(usedBuckets) / (float)(hashTable->size);
+	pHashTableInfo->largestBucketSize = largestBucketSize;
+	pHashTableInfo->dynamicBehaviour = hashTable->dynamicBehaviour;
+	pHashTableInfo->expandUseFactor = hashTable->expandUseFactor;
+	pHashTableInfo->contractUseFactor = hashTable->contractUseFactor;		
+	
+	return 0;	
+}
+
+int SetResizeBehaviour( HashTablePTR hashTable, int dynamicBehaviour, float expandUseFactor, float contractUseFactor )
+{
+	if(hashTable == NULL || *((int*)(hashTable)) != 0xDEADBEEF)
+		return -1;
+	if(contractUseFactor >= expandUseFactor)
+		return 1;
+	
+	hashTable->dynamicBehaviour = dynamicBehaviour;
+	hashTable->expandUseFactor = expandUseFactor;
+	hashTable->contractUseFactor = contractUseFactor;
+	
+	return 0;
+}
