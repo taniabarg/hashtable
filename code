@@ -31,7 +31,7 @@ static unsigned char HashFunction ( char *key, unsigned char range )
 
 	for(int i = 0; i < strlen(key); i++)
 		total += (int) key[i];		//This hash function sums up values of each character,
-	pos = total % range;			//then divides by the range and returns the remainder.
+	pos = total % range;			//then divides by the range and returns the remainder. 
 	if(pos < 0)
 		pos = -pos;
 
